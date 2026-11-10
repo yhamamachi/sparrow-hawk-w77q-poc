@@ -1,0 +1,21 @@
+software =
+{
+	version = "@VERSION@";
+	description = "Zephyr firmware for Cortex-R52 (@VERSION@), installed via Winbond W77Q secure update";
+	hardware-compatibility: [ "1.0" ];
+
+	images: (
+		{
+			filename = "zephyr.manifest";
+			sha256 = "@SHA_MAN@";
+			type = "winbond-secure-flash";
+			properties: { role = "manifest"; };
+		},
+		{
+			filename = "zephyr.bin";
+			sha256 = "@SHA_FW@";
+			type = "winbond-secure-flash";
+			properties: { role = "firmware"; keyfile = "@KEYFILE@"; section = "@SECTION@"; };
+		}
+	);
+}

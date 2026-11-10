@@ -1,0 +1,12 @@
+backup/
+build/
+keys/
+*.ko
+*.o
+.tmp_versions
+modules.order
+Module.symvers
+*.mod*
+.*.cmd
+lms_keys/
+priv_key_*
