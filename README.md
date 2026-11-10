@@ -26,6 +26,16 @@ Provisioning writes keys and a section layout into the W77Q permanently. Back up
 (`cat /dev/mtd0ro /dev/mtd1ro /dev/mtd2ro /dev/mtd3ro > flash_full.bin` on the board).
 This is a PoC with development keys, not a production design.
 
+## Keys are tied to the board
+
+The first `provision` writes a device master key derived from `keys/good.key` into the W77Q. It cannot be changed
+without `QLIB_Format`, which erases all sections (including the boot area). **Keep `good.key` for each board.**
+Generating new keys with `gen_test_assets.sh` and provisioning another section on the same board fails with
+`QLIB_STATUS__DEVICE_AUTHENTICATION_ERR`. In that case copy the original `good.key` (and `bad.key`) into
+`build/assets/keys/` before step 1 (`gen_test_assets.sh` keeps existing key files).
+Every update test needs a section with a fresh version counter, so each full run consumes one section
+(unused sections 5, 6, 7 on the tested board).
+
 ## Quick start
 
 Verified on: Sparrow Hawk, Debian 13 BSP (kernel 6.18.54), U-Boot 2026.10, Zephyr v4.4.0 (SDK 1.0.1),
