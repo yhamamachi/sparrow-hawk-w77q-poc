@@ -84,6 +84,12 @@ sudo ./tools/w77q_bind.sh bind && sudo ./build/w77q_probe; sudo ./tools/w77q_bin
 `tools/w77q_bind.sh bind` unbinds `spi-nor` (the `/dev/mtd*` devices disappear) and binds `w77q_raw`;
 `unbind` restores `spi-nor`. Always unbind afterwards.
 
+### Quick demo with `tools/demo.sh`
+
+After provisioning a section, `tools/demo.sh <case>...` runs `.swu` cases on the board and prints the section
+version before and after: `v1.0`, `v1.1`, `tamper`, `badkey`, `rollback`, `attacks` (= the last three).
+Step 4 below does the same by hand.
+
 ### 3. QLIB only: v1.0 -> v1.1 and the security tests (section 5)
 
 ```bash
