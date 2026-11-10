@@ -42,11 +42,6 @@ void W77Q_CloseFlash(void* p)
     if (h) { close(h->fd); free(h); }
 }
 
-void CORE_RESET(void)
-{
-    fprintf(stderr, "[platform] CORE_RESET requested: ignored on Linux user space\n");
-}
-
 static int do_xfer(int fd, uint8_t op, unsigned an, uint32_t addr, unsigned dummy,
                    int dir, void* buf, uint32_t len)
 {
@@ -55,6 +50,23 @@ static int do_xfer(int fd, uint8_t op, unsigned an, uint32_t addr, unsigned dumm
                            .buf = (uint64_t)(uintptr_t)buf };
     return ioctl(fd, W77Q_IOC_XFER, &x);
 }
+
+/* JEDEC software reset (0x66 + 0x99). Needed after QLIB_Format: the W77Q does not answer SPI until it is reset. */
+int W77Q_SpiReset(void* p)
+{
+    w77q_handle_t* h = p;
+    if (!h) return -1;
+    if (do_xfer(h->fd, 0x66, 0, 0, 0, W77Q_DIR_OUT, NULL, 0)) return -1;
+    if (do_xfer(h->fd, 0x99, 0, 0, 0, W77Q_DIR_OUT, NULL, 0)) return -1;
+    usleep(100000);
+    return 0;
+}
+
+void CORE_RESET(void)
+{
+    fprintf(stderr, "[platform] CORE_RESET requested: ignored on Linux user space\n");
+}
+
 
 /*
  * Map a QLIB transaction [cmd|addr|dataOut] [dummy] [dataIn] onto one spi-mem op:

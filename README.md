@@ -151,6 +151,32 @@ The Zephyr console (HSCIF1) prints `Zephyr Firmware Version 1.1`. Type `boot` to
 `tools/r52_run.sh` automates reboot, these commands and the UART capture from the PC that owns both serial ports
 (`NAS=<host with the serial ports> BOARD=<ssh host> OFFSET=<section address> tools/r52_run.sh`).
 
+## Advanced: reset the keys of a board (erases the boot area!)
+
+Needed only if the key file (`good.key`) is lost, or all unused sections are used up. `QLIB_Format` erases the data of
+the whole flash, **including the boot firmware**, so restore it from a backup before the next restart.
+Do not restart the board in between. This sequence was verified on one Sparrow Hawk (Linux kept running from its root
+file system on `/dev/sda1`, not from this flash, so no restart was needed):
+
+1. Back up (board, Linux): `cat /dev/mtd0ro /dev/mtd1ro /dev/mtd2ro /dev/mtd3ro > flash_full.bin`, and save the U-Boot
+   variables as text with `tools/uboot_env_backup.sh env.txt` (it restarts the board once and returns to Linux).
+2. `sudo ./tools/w77q_bind.sh bind`, then `sudo ./build/w77q_fwtool format --erase-everything`.
+   Observed: `QLIB_STATUS__HARDWARE_FAILURE`, and the flash then answers `00 00 00` to every SPI command.
+   (`QLIB_Format` with the factory-default option returned `NOT_SUPPORTED` on this flash, and changed nothing.)
+3. `sudo ./build/w77q_fwtool reset` (JEDEC reset `0x66` + `0x99`). The flash answers again.
+4. `sudo ./build/w77q_fwtool default-layout keys/good.key`: configures sections 0-7 of **both dies** (this flash has two
+   32 MiB dies) with plain read/write, and installs the keys again. The pre-provisioned master key is still present after
+   `QLIB_Format`, so the sample key flow works again. Without this step the upper 32 MiB reads as `00`.
+5. Write the backup back. The `boot` MTD partition is read-only in Linux, so use QLIB: split the backup
+   (`dd if=flash_full.bin of=boot.bin bs=1M count=16`) and run `sudo ./build/w77q_fwtool restore boot.bin 0`
+   (erase, write, read back and compare). The U-Boot environment partitions can be written with
+   `flashcp` (`/dev/mtd2`, `/dev/mtd3`) after `w77q_bind.sh unbind`.
+6. Read the flash again and `cmp` it with the backup. Then restart the board.
+
+Result on the tested board: the flash was bit-identical to the backup, the U-Boot variables were identical, Linux
+booted, and the QLIB-only procedure (check, provision, v1.0 -> v1.1, three attacks) passed again.
+Not verified: recovery with ipl-burning if the board is restarted while the flash is erased.
+
 ## Limitations
 
 Development keys in files, symmetric section key (no LMS), no production provisioning, `spi-nor` must be unbound

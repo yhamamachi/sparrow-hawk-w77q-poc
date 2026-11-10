@@ -9,6 +9,10 @@
  *   w77q_fwtool check     <keyfile> [section base size]   (read-only pre-flight check, same as run by provision)
  *   w77q_fwtool provision <keyfile> [section base size] [--force]
  *   w77q_fwtool install   <keyfile> <fw.bin> <manifest> [section]
+ *   w77q_fwtool format --erase-everything   (non-secure QLIB_Format: erases ALL sections, configuration and keys!)
+ *   w77q_fwtool default-layout <keyfile>     (after a format: sections 0-7, 4 MiB each, plain read/write = the board's original layout, with keys)
+ *   w77q_fwtool restore <file> <addr>        (plain erase+write of a flash area, then read back and compare; for restoring a backup)
+ *   w77q_fwtool reset                        (JEDEC reset 0x66/0x99; needed after format, harmless otherwise)
  *   w77q_fwtool status    [section]
  *   w77q_fwtool read      <out.bin> <len> [section]      (plain read of the active half)
  *
@@ -23,6 +27,7 @@
 
 void* W77Q_OpenFlash(const char*);
 void  W77Q_CloseFlash(void*);
+int   W77Q_SpiReset(void*);
 
 #define STR(x) #x
 #define NAME(x) [x] = #x
@@ -150,7 +155,7 @@ static int preflight(QLIB_CONTEXT_T* c, const char* keyfile, uint32_t sec, uint3
         }
     } else if (!pre) {
         printf("  [NG] no pre-provisioned master key and no device master key: the sample key flow of this tool may not work.\n"
-               "       (Not verified on a flash after QLIB_Format.) Use --force to try.\n");
+               "       Use --force to try.\n");
         bad = 1;
     } else
         printf("  [OK] factory state: the pre-provisioned master key is present, the device master key is not set yet\n");
@@ -173,6 +178,79 @@ static int preflight(QLIB_CONTEXT_T* c, const char* keyfile, uint32_t sec, uint3
     }
     if (bad && force) { printf("  --force given: continuing although checks failed\n"); return 0; }
     return bad;
+}
+
+static int cmd_format(void)
+{
+    QLIB_CONTEXT_T c; void* h; int rc = 0; QLIB_STATUS_T r;
+    if (session_init(&h, &c)) return 1;
+    printf("QLIB_Format: erasing ALL data, configuration and keys of the W77Q (non-secure FORMAT)\n");
+    r = QLIB_Format(&c, NULL, false, false);
+    printf("QLIB_Format -> %s (%d)\n", st(r), (int)r);
+    if (r != QLIB_STATUS__OK) rc = 1;
+    QLIB_Disconnect(&c); W77Q_CloseFlash(h);
+    return rc;
+}
+
+static int cmd_default_layout(const char* keyfile)
+{
+    QLIB_CONTEXT_T c; void* h; int rc = 0; QLIB_ID_T id; uint8_t secret[32];
+    if (load_secret(keyfile, secret)) return 1;
+    QLIB_FLASH_CONFIG_T fc = {0}; QLIB_DIE_CONFIG_T dc = {0};
+    static QLIB_SECTIONS_CONF_TABLE_T tbl[QLIB_MAX_DIES_SUPPORTED]; uint8_t die = 0, nd;
+    if (session_init(&h, &c)) return 1;
+    nd = QLIB_GET_NUM_OF_DIES(&c);
+    CK(QLIB_GetId(&c, &id));
+    CK(QLIB_GetDeviceConfigMultiDie(&c, &fc, &dc, tbl, nd));
+    CK(QLIB_GetActiveDie(&c, &die));
+    CK(QLIB_SAMPLE_GetDeviceKey(&c, id.sec.wid, QLIB_KID__DEVICE_KEY_PRE_PROVISIONING, dc.preProvisionedMasterKey));
+    if (derive(secret, "master", &id, 0, dc.deviceMasterKey)) { rc = 1; goto out; }
+    for (uint8_t d = 0; d < nd; d++)            /* every die has its own section table (this flash has 2 dies of 32 MiB) */
+        for (uint32_t i = 0; i < 8; i++) {
+            QLIB_EXTENDED_SECTION_CONF_T* e = &tbl[d].sectionConfigTable[i];
+            memset(&e->sectionConfig.policy, 0, sizeof e->sectionConfig.policy);
+            e->baseAddr = i * 0x400000u; e->size = 0x400000u;
+            e->sectionConfig.policy.plainAccessReadEnable = 1;
+            e->sectionConfig.policy.plainAccessWriteEnable = 1;
+            e->resetPA = true;
+            if (derive(secret, "full", &id, (uint32_t)d * QLIB_NUM_OF_SECTIONS + i, e->fullAccessKey)) { rc = 1; goto out; }
+        }
+    printf("configuring %u die(s) x sections 0-7: 4 MiB each, plain read/write, keys from %s\n", nd, keyfile);
+    CK(QLIB_ConfigDeviceMultiDie(&c, &fc, &dc, tbl, nd));
+    CK(QLIB_SetActiveDie(&c, die));
+    { char w[17]; wid_hex(&id, w); record_add(keyfile, w); }
+    printf("default layout OK\n");
+out:
+    QLIB_Disconnect(&c); W77Q_CloseFlash(h);
+    return rc;
+}
+
+static int cmd_restore(const char* path, uint32_t addr)
+{
+    QLIB_CONTEXT_T c; void* h; int rc = 0; uint32_t len = 0; uint8_t* fw = w77q_load_file(path, &len); static uint8_t rb[65536];
+    uint32_t written = 0, skipped = 0;
+    if (!fw) return 1;
+    if (session_init(&h, &c)) return 1;
+    printf("restore %u bytes to 0x%x\n", len, addr);
+    for (uint32_t off = 0; off < len; off += 65536) {
+        uint32_t n = len - off < 65536 ? len - off : 65536, i;
+        for (i = 0; i < n && fw[off + i] == 0xFF; i++) ;
+        CK(QLIB_Erase_LA(&c, addr + off, 65536, false));
+        if (i == n) { skipped++; continue; }
+        for (uint32_t o = 0; o < n; o += 256) CK(QLIB_Write_LA(&c, fw + off + o, addr + off + o, n - o < 256 ? n - o : 256, false));
+        written++;
+        if (!(written % 16)) { printf("  ... %u KiB\n", (off + n) / 1024); fflush(stdout); }
+    }
+    printf("written %u blocks, skipped %u empty blocks; verifying\n", written, skipped);
+    for (uint32_t off = 0; off < len; off += 65536) {
+        uint32_t n = len - off < 65536 ? len - off : 65536;
+        for (uint32_t o = 0; o < n; o += 256) CK(QLIB_Read_LA(&c, rb + o, addr + off + o, n - o < 256 ? n - o : 256, false, false));
+        if (memcmp(rb, fw + off, n)) { printf("VERIFY FAILED at 0x%x\n", addr + off); rc = 1; goto out; }
+    }
+    printf("restore OK (verified)\n");
+out:
+    QLIB_Disconnect(&c); W77Q_CloseFlash(h); free(fw);
+    return rc;
 }
 
 static int cmd_check(const char* keyfile, uint32_t sec, uint32_t base, uint32_t size)
@@ -278,6 +356,10 @@ out:
 int main(int argc, char** argv)
 {
     uint32_t sec = W77Q_SECTION_DEFAULT;
+    if (argc >= 3 && !strcmp(argv[1], "format") && !strcmp(argv[2], "--erase-everything")) return cmd_format();
+    if (argc >= 3 && !strcmp(argv[1], "default-layout")) return cmd_default_layout(argv[2]);
+    if (argc >= 4 && !strcmp(argv[1], "restore")) return cmd_restore(argv[2], (uint32_t)strtoul(argv[3], 0, 0));
+    if (argc >= 2 && !strcmp(argv[1], "reset")) { void* h = W77Q_OpenFlash(NULL); int r = h ? W77Q_SpiReset(h) : 1; if (h) W77Q_CloseFlash(h); printf("reset %s\n", r ? "FAILED" : "done"); return r ? 1 : 0; }
     if (argc >= 2 && !strcmp(argv[1], "status")) return cmd_status(argc > 2 ? (uint32_t)strtoul(argv[2], 0, 0) : sec);
     if (argc >= 4 && !strcmp(argv[1], "read")) return cmd_read(argv[2], (uint32_t)strtoul(argv[3], 0, 0), argc > 4 ? (uint32_t)strtoul(argv[4], 0, 0) : sec);
     if (argc >= 3 && (!strcmp(argv[1], "provision") || !strcmp(argv[1], "check"))) {
