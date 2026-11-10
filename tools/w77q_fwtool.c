@@ -6,7 +6,8 @@
  * are made by QLIB and the W77Q itself. This tool only orchestrates the documented QLIB
  * flow (same as samples/qlib_sample_fw_update.c) and derives keys from a key file.
  *
- *   w77q_fwtool provision <keyfile> [section base size]
+ *   w77q_fwtool check     <keyfile> [section base size]   (read-only pre-flight check, same as run by provision)
+ *   w77q_fwtool provision <keyfile> [section base size] [--force]
  *   w77q_fwtool install   <keyfile> <fw.bin> <manifest> [section]
  *   w77q_fwtool status    [section]
  *   w77q_fwtool read      <out.bin> <len> [section]      (plain read of the active half)
@@ -97,7 +98,94 @@ out:
     return rc;
 }
 
-static int cmd_provision(const char* keyfile, uint32_t sec, uint32_t base, uint32_t size)
+
+/* ---- pre-flight checks (read-only). Returns 0 = OK, 1 = blocking problem ---- */
+static void wid_hex(const QLIB_ID_T* id, char out[17])
+{
+    const uint8_t* p = (const uint8_t*)&id->sec.wid;
+    for (int i = 0; i < 8; i++) sprintf(out + 2 * i, "%02x", p[i]);
+}
+static int record_has(const char* keyfile, const char* wid)
+{
+    char path[512], line[64]; FILE* f; int found = 0;
+    snprintf(path, sizeof path, "%s.boards", keyfile);
+    f = fopen(path, "r");
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f)) if (!strncmp(line, wid, 16)) found = 1;
+    fclose(f);
+    return found;
+}
+static void record_add(const char* keyfile, const char* wid)
+{
+    char path[512]; FILE* f;
+    if (record_has(keyfile, wid)) return;
+    snprintf(path, sizeof path, "%s.boards", keyfile);
+    f = fopen(path, "a");
+    if (f) { fprintf(f, "%s\n", wid); fclose(f); }
+}
+
+static int preflight(QLIB_CONTEXT_T* c, const char* keyfile, uint32_t sec, uint32_t base, uint32_t size, bool force)
+{
+    QLIB_ID_T id; char wid[17]; bool pre = false, master = false; int bad = 0; static uint8_t buf[4096];
+    QLIB_SECTION_CONF_T sc = {0}; uint32_t sbase = 0, ssize = 0; QLIB_STATUS_T r;
+    printf("pre-flight check for section %u (base 0x%x, size 0x%x):\n", sec, base, size);
+    if (QLIB_GetId(c, &id) != QLIB_STATUS__OK) { printf("  [NG] cannot read the W77Q id\n"); return 1; }
+    wid_hex(&id, wid);
+    if (QLIB_GetDeviceSectionConfig(c, sec, &sbase, &ssize, &sc) == QLIB_STATUS__OK && sc.policy.rollbackProt) {
+        printf("  [OK] section %u is already a rollback-protected section: provisioning is not needed\n", sec);
+        return 0;
+    }
+    (void)QLIB_IsKeyProvisioned(c, QLIB_KID__DEVICE_KEY_PRE_PROVISIONING, 0, &pre);
+    (void)QLIB_IsKeyProvisioned(c, QLIB_KID__DEVICE_MASTER, 0, &master);
+    printf("  device id (WID): %s\n  pre-provisioned master key: %s, device master key: %s\n", wid, pre ? "present" : "absent", master ? "set" : "not set");
+    if (master) {
+        if (record_has(keyfile, wid))
+            printf("  [OK] this key file was used to provision this board before (%s.boards)\n", keyfile);
+        else {
+            printf("  [NG] the device master key of this board is already set, and this key file is not known to match it.\n"
+                   "       Provisioning would fail with QLIB_STATUS__DEVICE_AUTHENTICATION_ERR.\n"
+                   "       Use the key file that was used the first time. If it is lost, only QLIB_Format (erases ALL sections,\n"
+                   "       including the boot area) can reset the keys. If you are sure this is the right key file, use --force.\n");
+            bad = 1;
+        }
+    } else if (!pre) {
+        printf("  [NG] no pre-provisioned master key and no device master key: the sample key flow of this tool may not work.\n"
+               "       (Not verified on a flash after QLIB_Format.) Use --force to try.\n");
+        bad = 1;
+    } else
+        printf("  [OK] factory state: the pre-provisioned master key is present, the device master key is not set yet\n");
+
+    /* the region must be empty (0xFF): do not turn used boot data into a secure section */
+    {
+        uint32_t nonff = 0, first = 0xffffffff;
+        for (uint32_t off = 0; off < size; off += sizeof buf) {
+            uint32_t n = size - off < sizeof buf ? size - off : sizeof buf;
+            r = QLIB_Read_LA(c, buf, base + off, n, false, false);
+            if (r != QLIB_STATUS__OK) { printf("  [NG] cannot read flash at 0x%x (%d)\n", base + off, (int)r); return 1; }
+            for (uint32_t i = 0; i < n; i++) if (buf[i] != 0xFF) { if (first == 0xffffffff) first = base + off + i; nonff++; }
+        }
+        if (nonff) {
+            printf("  [NG] the target area is NOT empty: %u bytes are not 0xFF (first at 0x%x). It may be used by boot firmware.\n"
+                   "       Choose another area, or use --force if you know it is unused.\n", nonff, first);
+            bad = 1;
+        } else
+            printf("  [OK] the target area is empty\n");
+    }
+    if (bad && force) { printf("  --force given: continuing although checks failed\n"); return 0; }
+    return bad;
+}
+
+static int cmd_check(const char* keyfile, uint32_t sec, uint32_t base, uint32_t size)
+{
+    QLIB_CONTEXT_T c; void* h; int rc;
+    if (session_init(&h, &c)) return 1;
+    rc = preflight(&c, keyfile, sec, base, size, false);
+    printf("%s\n", rc ? "RESULT: NOT OK" : "RESULT: OK");
+    QLIB_Disconnect(&c); W77Q_CloseFlash(h);
+    return rc;
+}
+
+static int cmd_provision(const char* keyfile, uint32_t sec, uint32_t base, uint32_t size, bool force)
 {
     QLIB_CONTEXT_T c; void* h; int rc = 0; uint8_t secret[32];
     QLIB_ID_T id; QLIB_FLASH_CONFIG_T fc = {0}; QLIB_DIE_CONFIG_T dc = {0};
@@ -106,6 +194,7 @@ static int cmd_provision(const char* keyfile, uint32_t sec, uint32_t base, uint3
     if (load_secret(keyfile, secret)) return 1;
     if (session_init(&h, &c)) return 1;
     nd = QLIB_GET_NUM_OF_DIES(&c);
+    if (preflight(&c, keyfile, sec, base, size, force)) { fprintf(stderr, "provision aborted by the pre-flight check\n"); rc = 2; goto out; }
     CK(QLIB_GetId(&c, &id));
     CK(QLIB_GetDeviceConfigMultiDie(&c, &fc, &dc, tbl, nd));
     CK(QLIB_GetActiveDie(&c, &die));
@@ -132,6 +221,7 @@ static int cmd_provision(const char* keyfile, uint32_t sec, uint32_t base, uint3
     printf("provisioning section %u: base=0x%x size=0x%x rollback-protected\n", sec, base, size);
     CK(QLIB_ConfigDeviceMultiDie(&c, &fc, &dc, tbl, nd));
     CK(QLIB_SetActiveDie(&c, die));
+    { char w[17]; wid_hex(&id, w); record_add(keyfile, w); }
     printf("provision OK\n");
 out:
     QLIB_Disconnect(&c); W77Q_CloseFlash(h);
@@ -190,10 +280,14 @@ int main(int argc, char** argv)
     uint32_t sec = W77Q_SECTION_DEFAULT;
     if (argc >= 2 && !strcmp(argv[1], "status")) return cmd_status(argc > 2 ? (uint32_t)strtoul(argv[2], 0, 0) : sec);
     if (argc >= 4 && !strcmp(argv[1], "read")) return cmd_read(argv[2], (uint32_t)strtoul(argv[3], 0, 0), argc > 4 ? (uint32_t)strtoul(argv[4], 0, 0) : sec);
-    if (argc >= 3 && !strcmp(argv[1], "provision"))
-        return cmd_provision(argv[2], argc > 3 ? (uint32_t)strtoul(argv[3], 0, 0) : sec, argc > 4 ? (uint32_t)strtoul(argv[4], 0, 0) : W77Q_BASE_DEFAULT,
-                             argc > 5 ? (uint32_t)strtoul(argv[5], 0, 0) : W77Q_SIZE_DEFAULT);
+    if (argc >= 3 && (!strcmp(argv[1], "provision") || !strcmp(argv[1], "check"))) {
+        bool force = false; const char* a[8]; int n = 0;
+        for (int i = 2; i < argc && n < 8; i++) { if (!strcmp(argv[i], "--force")) force = true; else a[n++] = argv[i]; }
+        uint32_t sc = n > 1 ? (uint32_t)strtoul(a[1], 0, 0) : sec, b = n > 2 ? (uint32_t)strtoul(a[2], 0, 0) : W77Q_BASE_DEFAULT,
+                 z = n > 3 ? (uint32_t)strtoul(a[3], 0, 0) : W77Q_SIZE_DEFAULT;
+        return !strcmp(argv[1], "check") ? cmd_check(a[0], sc, b, z) : cmd_provision(a[0], sc, b, z, force);
+    }
     if (argc >= 5 && !strcmp(argv[1], "install")) return cmd_install(argv[2], argv[3], argv[4], argc > 5 ? (uint32_t)strtoul(argv[5], 0, 0) : sec);
-    fprintf(stderr, "usage: %s provision <keyfile> [sec base size] | install <keyfile> <fw.bin> <manifest> [sec] | status [sec] | read <out> <len> [sec]\n", argv[0]);
+    fprintf(stderr, "usage: %s check|provision <keyfile> [sec base size] [--force] | install <keyfile> <fw.bin> <manifest> [sec] | status [sec] | read <out> <len> [sec]\n", argv[0]);
     return 1;
 }

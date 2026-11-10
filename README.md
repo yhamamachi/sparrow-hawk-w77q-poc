@@ -30,11 +30,19 @@ This is a PoC with development keys, not a production design.
 
 The first `provision` writes a device master key derived from `keys/good.key` into the W77Q. It cannot be changed
 without `QLIB_Format`, which erases all sections (including the boot area). **Keep `good.key` for each board.**
-Generating new keys with `gen_test_assets.sh` and provisioning another section on the same board fails with
-`QLIB_STATUS__DEVICE_AUTHENTICATION_ERR`. In that case copy the original `good.key` (and `bad.key`) into
-`build/assets/keys/` before step 1 (`gen_test_assets.sh` keeps existing key files).
-Every update test needs a section with a fresh version counter, so each full run consumes one section
-(unused sections 5, 6, 7 on the tested board).
+
+`w77q_fwtool provision` runs a read-only pre-flight check first (you can run it alone with `w77q_fwtool check ...`).
+It stops before writing anything when:
+
+* the device master key is already set and the key file is not known to match it (the tool records the device id
+  in `<keyfile>.boards` after a successful provisioning),
+* the target flash area is not empty (it may hold boot firmware).
+
+`--force` skips these stops. Generating new keys with `gen_test_assets.sh` on a board that was provisioned before is
+the typical case: copy the original `good.key` (and `bad.key`) into `build/assets/keys/` before step 1
+(`gen_test_assets.sh` keeps existing key files). A board provisioned before the check existed has no `.boards` record,
+so use `--force` once.
+Every update test needs a section with a fresh version counter, so each full run consumes one section.
 
 ## Quick start
 
@@ -94,6 +102,7 @@ Step 4 below does the same by hand.
 
 ```bash
 sudo ./tools/w77q_bind.sh bind
+sudo ./build/w77q_fwtool check keys/good.key 5 0x01400000 0x100000   # must print RESULT: OK
 sudo ./build/w77q_fwtool provision keys/good.key 5 0x01400000 0x100000
 sudo ./build/w77q_fwtool install keys/good.key build/assets/valid-v1.0.bin build/assets/valid-v1.0.manifest 5
 # run R52 (step 5) -> "Zephyr Firmware Version 1.0"
